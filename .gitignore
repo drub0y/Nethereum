@@ -33,6 +33,7 @@ src/compiledlibraries/net461dlls/
 src/compiledlibraries/net472dlls/
 src/compiledlibraries/net461dllsAOT/
 src/compiledlibraries/net472dllsAOT/
+src/compiledlibraries/netStandard/
 src/compiledlibraries/unitynet35dlls/
 FxOutput/Nethereum.Fx/**
 FxOutput/Nethereum.Fx.Tests/**
