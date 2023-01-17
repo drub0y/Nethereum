@@ -19,21 +19,38 @@ namespace Nethereum.RPC.Tests.Testers
         {
 
             Block receivedMessage = null;
+            await StreamingClient.StartAsync();
+            
+            var receivedTcs = new TaskCompletionSource<Block>();
             var subscription = new EthNewBlockHeadersSubscription(StreamingClient);
             subscription.SubscriptionDataResponse += delegate(object sender, StreamingEventArgs<Block> args)
                 {
                     receivedMessage = args.Response;
+
+                    receivedTcs.SetResult(receivedMessage);
                 };
 
             await subscription.SubscribeAsync(Guid.NewGuid().ToString()).ConfigureAwait(false);
+
+            await StreamingClient.SendRequestAsync(
+                new RpcRequest(Guid.NewGuid().ToString(), "evm_mine", new object[] { new {blocks=1} }),
+                TestRpcStreamingResponseHandler.Create()
+            );
+
+            CancellationTokenSource cts = new CancellationTokenSource();
+            cts.CancelAfter(10000);
             
             try
             {
-                await Task.Delay(10000).ConfigureAwait(false);
+                receivedTcs.Task.Wait(cts.Token);
             }
-            catch (TaskCanceledException)
+            catch (TaskCanceledException taskCanceledException)
             {
-                // swallow, escape hatch
+                throw new Exception("Timed out waiting for block header!", taskCanceledException);
+            }
+            finally
+            {
+                cts.Dispose();
             }
 
             Assert.NotNull(receivedMessage);
@@ -48,6 +65,43 @@ namespace Nethereum.RPC.Tests.Testers
         public override Type GetRequestType()
         {
             return typeof (EthNewPendingTransactionSubscription);
+        }
+    }
+
+    public class TestRpcStreamingResponseHandler : IRpcStreamingResponseHandler
+    {
+        private readonly Action onResponse;
+        private readonly Action onClientError;
+        private readonly Action onClientDisconnection;
+
+        public TestRpcStreamingResponseHandler(Action onResponse, Action onClientError, Action onClientDisconnection)
+        {
+            this.onResponse = onResponse;
+            this.onClientError = onClientError;
+            this.onClientDisconnection = onClientDisconnection;
+        }
+
+        public void HandleClientDisconnection()
+        {
+            this.onClientDisconnection?.Invoke();
+        }
+
+        public void HandleClientError(Exception ex)
+        {
+            this.onClientError?.Invoke();
+        }
+
+        public void HandleResponse(RpcStreamingResponseMessage rpcStreamingResponse)
+        {
+            this.onResponse?.Invoke();
+        }
+
+        public static TestRpcStreamingResponseHandler Create(
+            Action onResponse = null,
+            Action onClientError = null,
+            Action onClientDisconnection = null)
+        {
+            return new TestRpcStreamingResponseHandler(onResponse, onClientError, onClientDisconnection);
         }
     }
 }

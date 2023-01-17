@@ -1,4 +1,4 @@
-﻿{
+{
   "liveSettings": {
     "rpcUrl": "https://mainnet.infura.io",
     "wsUrl": "wss://mainnet.infura.io/ws"
@@ -7,6 +7,7 @@
     "defaultAccount": "0x12890D2cce102216644c59daE5baed380d84830c",
     "defaultAccountPassword": "password",
     "rpcUrl": "http://localhost:8545/",
+    "wsUrl": "ws://localhost:8545",
     "debugLogLocation": "I:\\JuanFran\\Documents\\Source\\Repos\\Nethereum\\testchain\\log.txt",
     "blockhash": "0x0b7f7e2151328f33dbb14a8285331a6fd0b1081d1f5edea1937b7bee4dce7c5b",
     "blockNumber": "1",

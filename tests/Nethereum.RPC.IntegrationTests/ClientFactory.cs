@@ -22,7 +22,7 @@ namespace Nethereum.RPC.Tests
         //TODO:Subscriptions
         public static IStreamingClient GetStreamingClient(TestSettings settings)
         {
-            var url = settings.GetLiveWSRpcUrl();
+            var url = settings.GetWSRpcUrl();
             return new StreamingWebSocketClient(url);
         }
     }

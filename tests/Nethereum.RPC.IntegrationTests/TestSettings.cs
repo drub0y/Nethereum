@@ -92,6 +92,11 @@ namespace Nethereum.RPC.Tests.Testers
             return GetAppSettingsValue("rpcUrl");
         }
 
+        public string GetWSRpcUrl()
+        {
+            return GetAppSettingsValue("wsUrl");
+        }
+
         public string GetDefaultAccountPassword()
         {
             return GetAppSettingsValue("defaultAccountPassword");
