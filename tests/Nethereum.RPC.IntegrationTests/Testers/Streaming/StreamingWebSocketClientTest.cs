@@ -17,7 +17,7 @@ namespace Nethereum.RPC.Tests.Testers.Streaming
         [Fact]
         public async Task WhenWebSocketIsNull_SendAsync_ThrowsExpectedException()
         {
-            var client = new StreamingWebSocketClient("");
+            var client = new StreamingWebSocketClient("https://localhost:8546");
 
             var rpcRequestMessage = new RpcRequestMessage("", "");
             var mockResponseHandler = new Mock<IRpcStreamingResponseHandler>();
