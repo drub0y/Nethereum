@@ -26,6 +26,9 @@ namespace Nethereum.JsonRpc.WebSocketClient
         private readonly ConcurrentDictionary<Object, TaskCompletionSource<MemoryStream>> _pendingRequests =
             new ConcurrentDictionary<Object, TaskCompletionSource<MemoryStream>>();
 
+        private readonly ConcurrentQueue<TaskCompletionSource<MemoryStream>> _pendingBatchRequests =
+            new ConcurrentQueue<TaskCompletionSource<MemoryStream>>();
+
         public Dictionary<string, string> RequestHeaders { get; set; } = new Dictionary<string, string>();
         protected string Path { get; set; }
         public static int ForceCompleteReadTotalMilliseconds { get; set; } = 2000;
