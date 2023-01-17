@@ -197,6 +197,7 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
         {
             CancellationTokenSource timeoutTokenSource = null;
             CancellationTokenSource tokenSource = null;
+            
             try
             {
                 timeoutTokenSource = new CancellationTokenSource(ForceCompleteReadTotalMilliseconds);
@@ -226,8 +227,8 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
         public async Task<MemoryStream> ReceiveFullResponseAsync(ClientWebSocket client)
         {
             var readBufferSize = 512;
-            var memoryStream = new MemoryStream();
-            bool completedNextMessage = false;
+            var memoryStream = new MemoryStream(readBufferSize);
+            var completedNextMessage = false;
 
             while (!completedNextMessage && !_cancellationTokenSource.IsCancellationRequested)
             {
@@ -289,7 +290,6 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
         private async Task HandleIncomingMessagesAsync()
         {
             var logger = new RpcLogger(_log);
-            MemoryStream memoryData = null;
 
             while (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
             {
@@ -297,12 +297,15 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
                 {
                     var webSocket = _clientWebSocket;
 
-                    if (webSocket != null && webSocket.State == WebSocketState.Open && AnyQueueRequests()) {
+                    if (webSocket != null && webSocket.State == WebSocketState.Open && AnyQueueRequests()) 
+                    {
+                        MemoryStream memoryData;
+
                         try 
                         {
                             await _semaphoreSlimRead.WaitAsync().ConfigureAwait(false);
 
-                            await ReceiveFullResponseAsync(webSocket).ConfigureAwait(false);
+                            memoryData = await ReceiveFullResponseAsync(webSocket).ConfigureAwait(false);
                         } 
                         finally 
                         {
@@ -326,6 +329,8 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
 
                             }
                         }
+
+                        memoryData.Dispose();
                     }
                 }
                 catch (Exception ex)
@@ -340,10 +345,6 @@ namespace Nethereum.JsonRpc.WebSocketStreamingClient
                         logger.LogException(ex);
                         
                     }
-                }
-                finally
-                {
-                    memoryData?.Dispose();
                 }
             }
         }
