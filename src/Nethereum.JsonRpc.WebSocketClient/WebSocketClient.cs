@@ -20,18 +20,19 @@ namespace Nethereum.JsonRpc.WebSocketClient
     {
         private static readonly Object BatchRequestId = new Object();
 
+        private readonly SemaphoreSlim _semaphoreSlimClientWebSocket = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _semaphoreSlimRead = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _semaphoreSlimWrite = new SemaphoreSlim(1, 1);
 
-        private readonly ConcurrentDictionary<Object, TaskCompletionSource<MemoryStream>> _pendingRequests =
-            new ConcurrentDictionary<Object, TaskCompletionSource<MemoryStream>>();
+        private readonly ConcurrentDictionary<Object, TaskCompletionSource<RpcResponseMessage>> _pendingRequests =
+            new ConcurrentDictionary<Object, TaskCompletionSource<RpcResponseMessage>>(new RequestMessageIdValueEqualityComparer());
 
-        private readonly ConcurrentQueue<TaskCompletionSource<MemoryStream>> _pendingBatchRequests =
-            new ConcurrentQueue<TaskCompletionSource<MemoryStream>>();
+        private readonly ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>> _pendingBatchRequests =
+            new ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>>();
 
         public Dictionary<string, string> RequestHeaders { get; set; } = new Dictionary<string, string>();
         protected string Path { get; set; }
-        public static int ForceCompleteReadTotalMilliseconds { get; set; } = 2000;
+        public static int ForceCompleteReadTotalMilliseconds { get; set; } = 30000;
 
         private WebSocketClient(string path, JsonSerializerSettings jsonSerializerSettings = null)
         {
@@ -46,7 +47,6 @@ namespace Nethereum.JsonRpc.WebSocketClient
         }
 
         public JsonSerializerSettings JsonSerializerSettings { get; set; }
-        private readonly object _lockingObject = new object();
         private readonly ILogger _log;
 
         private ClientWebSocket _clientWebSocket;
@@ -64,22 +64,27 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
         public async Task StopAsync(WebSocketCloseStatus webSocketCloseStatus, string status, CancellationToken timeOutToken)
         {
-            try
+            if (_clientWebSocket != null && (_clientWebSocket.State == WebSocketState.Open || _clientWebSocket.State == WebSocketState.Connecting))
             {
-                if (_clientWebSocket != null && (_clientWebSocket.State == WebSocketState.Open || _clientWebSocket.State == WebSocketState.Connecting))
-                {
+                await _semaphoreSlimClientWebSocket.WaitAsync().ConfigureAwait(false);
 
-                    await Task.WhenAll(_semaphoreSlimRead.WaitAsync(), _semaphoreSlimRead.WaitAsync()).ConfigureAwait(false);
-                    await _clientWebSocket.CloseOutputAsync(webSocketCloseStatus, status, timeOutToken).ConfigureAwait(false);
-                    while (_clientWebSocket.State != WebSocketState.Closed && !timeOutToken.IsCancellationRequested) ;
+                try
+                {
+                    // Check to make sure someone else didn't beat us into the semaphore and stop things
+                    if (_clientWebSocket != null && (_clientWebSocket.State == WebSocketState.Open || _clientWebSocket.State == WebSocketState.Connecting))
+                    {
+                        await Task.WhenAll(_semaphoreSlimRead.WaitAsync(), _semaphoreSlimRead.WaitAsync()).ConfigureAwait(false);
+                        await _clientWebSocket.CloseOutputAsync(webSocketCloseStatus, status, timeOutToken).ConfigureAwait(false);
+                        while (_clientWebSocket.State != WebSocketState.Closed && !timeOutToken.IsCancellationRequested) ;
+                    }
                 }
-                
-            }
-            finally
-            {
-                _semaphoreSlimRead.Release();
-                _semaphoreSlimWrite.Release();
-            }
+                finally
+                {
+                    _semaphoreSlimRead.Release();
+                    _semaphoreSlimWrite.Release();
+                    _semaphoreSlimClientWebSocket.Release();
+                }
+            }                
 
         }
 
@@ -89,16 +94,33 @@ namespace Nethereum.JsonRpc.WebSocketClient
             {
                 if (_clientWebSocket == null || _clientWebSocket.State != WebSocketState.Open)
                 {
-                    _clientWebSocket = new ClientWebSocket();
-                    if (RequestHeaders != null)
+                    await _semaphoreSlimClientWebSocket.WaitAsync().ConfigureAwait(false);
+
+                    try
                     {
-                        foreach (var requestHeader in RequestHeaders)
+                        // Check to make sure someone else didn't beat us into the semaphore and initialize a new one
+                        if (_clientWebSocket == null || _clientWebSocket.State != WebSocketState.Open)
                         {
-                            _clientWebSocket.Options.SetRequestHeader(requestHeader.Key, requestHeader.Value);
+                            _clientWebSocket = new ClientWebSocket();
+
+                            if (RequestHeaders != null)
+                            {
+                                foreach (var requestHeader in RequestHeaders)
+                                {
+                                    _clientWebSocket.Options.SetRequestHeader(requestHeader.Key, requestHeader.Value);
+                                }
+                            }
+
+                            await _clientWebSocket.ConnectAsync(new Uri(Path), new CancellationTokenSource(ConnectionTimeout).Token).ConfigureAwait(false);
+
+                            // Start the async read loop now that we are connected
+                            ReadNextResponseMessage(_clientWebSocket);
                         }
                     }
-                    await _clientWebSocket.ConnectAsync(new Uri(Path), new CancellationTokenSource(ConnectionTimeout).Token).ConfigureAwait(false);
-
+                    finally
+                    {
+                        _semaphoreSlimClientWebSocket.Release();
+                    }
                 }
             }
             catch (TaskCanceledException ex)
@@ -112,6 +134,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 _clientWebSocket = null;
                 throw;
             }
+
             return _clientWebSocket;
         }
 
@@ -121,9 +144,13 @@ namespace Nethereum.JsonRpc.WebSocketClient
             try
             {
                 var segmentBuffer = new ArraySegment<byte>(buffer);
-                return await client
-                    .ReceiveAsync(segmentBuffer, new CancellationTokenSource(ForceCompleteReadTotalMilliseconds).Token)
-                    .ConfigureAwait(false);
+
+                using(var cancellationTokenSource = new CancellationTokenSource(ForceCompleteReadTotalMilliseconds))
+                {
+                    return await client
+                        .ReceiveAsync(segmentBuffer, cancellationTokenSource.Token)
+                        .ConfigureAwait(false);
+                }
             }
             catch (TaskCanceledException ex)
             {
@@ -131,79 +158,113 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
         }
 
-        public async Task ReceiveFullResponseAsync(ClientWebSocket client, Object requestId, CancellationToken cancellationToken)
+        public async Task<MemoryStream> ReceiveFullResponseAsync(ClientWebSocket client)
         {
-            var readBufferSize = 512;
-            var memoryStream = new MemoryStream(readBufferSize);
+            var readBufferSize = 8192;
+            var memoryStream = new MemoryStream();
 
             var buffer = new byte[readBufferSize];
             var completedMessage = false;
 
+            while (!completedMessage)
+            {
+                var receivedResult = await ReceiveBufferedResponseAsync(client, buffer).ConfigureAwait(false);
+                var bytesRead = receivedResult.Count;
+                if (bytesRead > 0)
+                {
+                    memoryStream.Write(buffer, 0, bytesRead);
+                    var lastByte = buffer[bytesRead - 1];
+
+                    if (lastByte == 10 || receivedResult.EndOfMessage)  //return signaled with a line feed / or just less than the full message
+                    {
+                        completedMessage = true;
+                    }
+                }
+                else
+                {
+                    // We have had a response already and EndOfMessage
+                    if(receivedResult.EndOfMessage)
+                    {
+                        completedMessage = true;
+                    }
+                }
+            }
+
+            if (memoryStream.Length == 0) return await ReceiveFullResponseAsync(client).ConfigureAwait(false); //empty response
+            return memoryStream;
+        }
+
+        private async void ReadNextResponseMessage(ClientWebSocket client)
+        {
+            // If the web socket is not open, then we don't want to continue reading and can just break out of the async
+            // loop here
+            if(client.State != WebSocketState.Open) {
+                return;
+            }
+
             try 
             {
-                await _semaphoreSlimRead.WaitAsync().ConfigureAwait(false);
-
-                while (!completedMessage)
+                MemoryStream memoryStream;
+                
+                try 
                 {
-                    var receivedResult = await ReceiveBufferedResponseAsync(client, buffer).ConfigureAwait(false);
-                    var bytesRead = receivedResult.Count;
-                    if (bytesRead > 0)
-                    {
-                        memoryStream.Write(buffer, 0, bytesRead);
-                        var lastByte = buffer[bytesRead - 1];
+                    await _semaphoreSlimRead.WaitAsync().ConfigureAwait(false);
 
-                        if (lastByte == 10 || receivedResult.EndOfMessage)  //return signaled with a line feed / or just less than the full message
+                    memoryStream = await ReceiveFullResponseAsync(client).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _semaphoreSlimRead.Release();
+                }
+
+                memoryStream.Position = 0;
+                using (var streamReader = new StreamReader(memoryStream))
+                using (var reader = new JsonTextReader(streamReader))
+                {
+                    reader.Read();
+
+                    var serializer = JsonSerializer.Create(JsonSerializerSettings);
+
+                    if(reader.TokenType == JsonToken.StartObject)
+                    {
+                        var responseMessage = serializer.Deserialize<RpcResponseMessage>(reader);
+                        
+                        // If the pending request task completion source still exists, try to resolve it with the response
+                        if(_pendingRequests.TryGetValue(responseMessage.Id, out var responseTaskCompletionSource))
                         {
-                            completedMessage = true;
+                            // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
+                            responseTaskCompletionSource.SetResult(responseMessage);
+                        }
+                        else
+                        {
+                            _log.Log(LogLevel.Warning, $"No pending request found for response with id: {responseMessage.Id}; dropping.");
                         }
                     }
                     else
                     {
-                        // We have had a response already and EndOfMessage
-                        if(receivedResult.EndOfMessage)
+                        // If the pending request task completion source still exists, try to resolve it with the response
+                        if(_pendingBatchRequests.TryPeek(out var responseTaskCompletionSource))
                         {
-                            completedMessage = true;
+                            // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
+                            responseTaskCompletionSource.SetResult(serializer.Deserialize<RpcResponseMessage[]>(reader));
+                        }
+                        else
+                        {
+                            _log.Log(LogLevel.Warning, $"No pending batch requests found; dropping batch response.");
                         }
                     }
                 }
-            }
-            finally
-            {
-                _semaphoreSlimRead.Release();
+            } catch (Exception exception) {
+                _log.LogError(exception, "Error reading RPC response.");
             }
 
-            TaskCompletionSource<MemoryStream> responseTaskCompletionSource = null;
-
-            // If this is a batch request, then we want to resolve the first pending batch request otherwise we 
-            // resolve the request with the given id
-            if(Object.ReferenceEquals(WebSocketClient.BatchRequestId, requestId)) {
-                _pendingBatchRequests.TryPeek(out responseTaskCompletionSource);
-            }
-            else 
-            {
-                _pendingRequests.TryGetValue(requestId, out responseTaskCompletionSource);
-            }
-
-            // Get the pending request and, only if it still exists, try to resolve it with the response
-            if(responseTaskCompletionSource != null) 
-            {
-                // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
-                if (memoryStream.Length > 0) {
-                    responseTaskCompletionSource.SetResult(memoryStream);
-
-                    return;
-                }
-
-                // We received an empty response, asynchronously recurse to receive next response
-                memoryStream.Dispose();
-                
-                await ReceiveFullResponseAsync(client, requestId, cancellationToken).ConfigureAwait(false);
-            }
+            // Initiate the read of the next response message (effectively an async read loop)
+            ReadNextResponseMessage(client);
         }
 
         protected override async Task<RpcResponseMessage> SendAsync(RpcRequestMessage request, string route = null)
         {
-            var responseTaskCompletionSource = new TaskCompletionSource<MemoryStream>();
+            var responseTaskCompletionSource = new TaskCompletionSource<RpcResponseMessage>();
             
             if(!this._pendingRequests.TryAdd(request.Id, responseTaskCompletionSource)) {
                 throw new InvalidOperationException($"A request with the specified id is already pending: {request.Id}");
@@ -215,56 +276,49 @@ namespace Nethereum.JsonRpc.WebSocketClient
             {
                 var rpcRequestJson = JsonConvert.SerializeObject(request, JsonSerializerSettings);
                 var requestBytes = new ArraySegment<byte>(Encoding.UTF8.GetBytes(rpcRequestJson));
+                
                 logger.LogRequest(rpcRequestJson);
 
                 var webSocket = await GetClientWebSocketAsync().ConfigureAwait(false);
-                var cancellationTokenSource = new CancellationTokenSource();
 
                 try
                 {
                     await _semaphoreSlimWrite.WaitAsync().ConfigureAwait(false);
-                    cancellationTokenSource.CancelAfter(ConnectionTimeout);
-
-                    await webSocket.SendAsync(requestBytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token)
-                        .ConfigureAwait(false);
+                    
+                    using(var cancellationTokenSource = new CancellationTokenSource(ConnectionTimeout))
+                    {
+                        await webSocket.SendAsync(requestBytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token)
+                            .ConfigureAwait(false);
+                    }
                 }
                 finally
                 {
                     _semaphoreSlimWrite.Release();
                 }
 
-                ReceiveFullResponseAsync(webSocket, request.Id, cancellationTokenSource.Token);
-                
-                using(var memoryData = await responseTaskCompletionSource.Task.ConfigureAwait(false))
-                {
-                    memoryData.Position = 0;
-                    using (var streamReader = new StreamReader(memoryData))
-                    using (var reader = new JsonTextReader(streamReader))
-                    {
-                        var serializer = JsonSerializer.Create(JsonSerializerSettings);
-                        var message = serializer.Deserialize<RpcResponseMessage>(reader);
-                        logger.LogResponse(message);
-                        return message;
-                    }
-                }
+                var responseMessage = await responseTaskCompletionSource.Task.ConfigureAwait(false);
+
+                logger.LogResponse(responseMessage);
+
+                return responseMessage;
             }
             catch (Exception ex)
             {
-                var exception = new RpcClientUnknownException("Error occurred when trying to web socket requests(s): " + request.Method, ex);
+                var exception = new RpcClientUnknownException("Error occurred when trying to make a web socket request." + request.Method, ex);
                 logger.LogException(exception);
 
                 throw exception;
             }
             finally
             {
-                // Always clear the pending request
+                // Always clear the pending request no matter what
                 this._pendingRequests.TryRemove(request.Id, out _);
             }
         }
 
         protected async override Task<RpcResponseMessage[]> SendAsync(RpcRequestMessage[] requests)
         {
-            var responseTaskCompletionSource = new TaskCompletionSource<MemoryStream>();
+            var responseTaskCompletionSource = new TaskCompletionSource<RpcResponseMessage[]>();
             
             _pendingBatchRequests.Enqueue(responseTaskCompletionSource);
             
@@ -290,25 +344,14 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 finally
                 {
                     _semaphoreSlimWrite.Release();
+                    cancellationTokenSource.Dispose();
                 }
 
-                ReceiveFullResponseAsync(webSocket, WebSocketClient.BatchRequestId, cancellationTokenSource.Token);
-
-                using (var memoryData = await responseTaskCompletionSource.Task.ConfigureAwait(false))
-                {
-                    memoryData.Position = 0;
-                    using (var streamReader = new StreamReader(memoryData))
-                    using (var reader = new JsonTextReader(streamReader))
-                    {
-                        var serializer = JsonSerializer.Create(JsonSerializerSettings);
-                        var messages = serializer.Deserialize<RpcResponseMessage[]>(reader);
-                        return messages;
-                    }
-                }
+                return await responseTaskCompletionSource.Task.ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                var exception = new RpcClientUnknownException("Error occurred when trying to web socket requests(s)", ex);
+                var exception = new RpcClientUnknownException("Error occurred when trying to make a batch web socket request.", ex);
                 logger.LogException(exception);
                 throw exception;
             }
@@ -331,6 +374,19 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
             _clientWebSocket?.Dispose();
             _clientWebSocket = null;
+        }
+
+        private sealed class RequestMessageIdValueEqualityComparer : IEqualityComparer<Object>
+        {
+            public new bool Equals(object x, object y)
+            {
+                return x?.Equals(y) ?? y == null;
+            }
+
+            public int GetHashCode(object obj)
+            {
+                return obj?.GetHashCode() ?? 0;
+            }
         }
     }
 }
