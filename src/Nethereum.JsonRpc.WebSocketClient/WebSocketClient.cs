@@ -19,6 +19,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
     public class WebSocketClient : ClientBase, IDisposable, IClientRequestHeaderSupport
     {
         private static readonly Object BatchRequestId = new Object();
+        private static readonly int ReadBufferSize = 8192;
 
         private readonly SemaphoreSlim _semaphoreSlimClientWebSocket = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _semaphoreSlimRead = new SemaphoreSlim(1, 1);
@@ -29,6 +30,8 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
         private readonly ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>> _pendingBatchRequests =
             new ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>>();
+
+        private readonly byte[] _readBuffer = new byte[ReadBufferSize];
 
         public Dictionary<string, string> RequestHeaders { get; set; } = new Dictionary<string, string>();
         protected string Path { get; set; }
@@ -138,7 +141,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
             return _clientWebSocket;
         }
 
-
+        [Obsolete("This method is intended to support internal functionality and should not be used directly.")]
         public async Task<WebSocketReceiveResult> ReceiveBufferedResponseAsync(ClientWebSocket client, byte[] buffer)
         {
             try
@@ -158,22 +161,23 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
         }
 
+        [Obsolete("This method is intended to support internal functionality and should not be used directly.")]
         public async Task<MemoryStream> ReceiveFullResponseAsync(ClientWebSocket client)
         {
-            var readBufferSize = 8192;
-            var memoryStream = new MemoryStream();
+            var responseMessageStream = new MemoryStream(ReadBufferSize);
 
-            var buffer = new byte[readBufferSize];
             var completedMessage = false;
 
             while (!completedMessage)
             {
-                var receivedResult = await ReceiveBufferedResponseAsync(client, buffer).ConfigureAwait(false);
+                var receivedResult = await ReceiveBufferedResponseAsync(client, _readBuffer).ConfigureAwait(false);
                 var bytesRead = receivedResult.Count;
+                
                 if (bytesRead > 0)
                 {
-                    memoryStream.Write(buffer, 0, bytesRead);
-                    var lastByte = buffer[bytesRead - 1];
+                    responseMessageStream.Write(_readBuffer, 0, bytesRead);
+
+                    var lastByte = _readBuffer[bytesRead - 1];
 
                     if (lastByte == 10 || receivedResult.EndOfMessage)  //return signaled with a line feed / or just less than the full message
                     {
@@ -190,8 +194,8 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 }
             }
 
-            if (memoryStream.Length == 0) return await ReceiveFullResponseAsync(client).ConfigureAwait(false); //empty response
-            return memoryStream;
+            if (responseMessageStream.Length == 0) return await ReceiveFullResponseAsync(client).ConfigureAwait(false); //empty response
+            return responseMessageStream;
         }
 
         private async void ReadNextResponseMessage(ClientWebSocket client)
@@ -225,6 +229,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
                     var serializer = JsonSerializer.Create(JsonSerializerSettings);
 
+                    // Check if it's a single message or a batch (a batch would be a StartArray token)
                     if(reader.TokenType == JsonToken.StartObject)
                     {
                         var responseMessage = serializer.Deserialize<RpcResponseMessage>(reader);
