@@ -18,41 +18,54 @@ namespace Nethereum.JsonRpc.WebSocketClient
 {
     public class WebSocketClient : ClientBase, IDisposable, IClientRequestHeaderSupport
     {
-        private static readonly Object BatchRequestId = new Object();
-        private static readonly int ReadBufferSize = 8192;
+        private static readonly int DefaultMessageBufferSize = 8192;
+        private static readonly Encoding WebSocketMessageEncoding = new UTF8Encoding(false);
 
         private readonly SemaphoreSlim _semaphoreSlimClientWebSocket = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _semaphoreSlimRead = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _semaphoreSlimWrite = new SemaphoreSlim(1, 1);
-
         private readonly ConcurrentDictionary<Object, TaskCompletionSource<RpcResponseMessage>> _pendingRequests =
             new ConcurrentDictionary<Object, TaskCompletionSource<RpcResponseMessage>>(new RequestMessageIdValueEqualityComparer());
-
         private readonly ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>> _pendingBatchRequests =
             new ConcurrentQueue<TaskCompletionSource<RpcResponseMessage[]>>();
+        private readonly byte[] _readBuffer = new byte[DefaultMessageBufferSize];        
+        private JsonSerializerSettings _jsonSerializerSettings;
+        private JsonSerializer _jsonSerializer;
+        private readonly ILogger _log;
+        private ClientWebSocket _clientWebSocket;
 
-        private readonly byte[] _readBuffer = new byte[ReadBufferSize];
+        private WebSocketClient(string path, JsonSerializerSettings jsonSerializerSettings = null)
+        {
+            this.SetBasicAuthenticationHeaderFromUri(new Uri(path));
+            
+            Path = path;
+            JsonSerializerSettings = jsonSerializerSettings;
+        }
 
         public Dictionary<string, string> RequestHeaders { get; set; } = new Dictionary<string, string>();
         protected string Path { get; set; }
         public static int ForceCompleteReadTotalMilliseconds { get; set; } = 30000;
 
-        private WebSocketClient(string path, JsonSerializerSettings jsonSerializerSettings = null)
-        {
-            this.SetBasicAuthenticationHeaderFromUri(new Uri(path));
-            if (jsonSerializerSettings == null)
+        public JsonSerializerSettings JsonSerializerSettings
+        { 
+            get 
             {
-                jsonSerializerSettings = DefaultJsonSerializerSettingsFactory.BuildDefaultJsonSerializerSettings();
-            }
+                return _jsonSerializerSettings;
+            } 
+            
+            set 
+            {
+                if(value == null)
+                {
+                    value = DefaultJsonSerializerSettingsFactory.BuildDefaultJsonSerializerSettings();
+                }
 
-            Path = path;
-            JsonSerializerSettings = jsonSerializerSettings;
+                _jsonSerializerSettings = value;                
+                _jsonSerializer = JsonSerializer.Create(_jsonSerializerSettings);
+            }
         }
 
-        public JsonSerializerSettings JsonSerializerSettings { get; set; }
-        private readonly ILogger _log;
-
-        private ClientWebSocket _clientWebSocket;
+       
 
 
         public WebSocketClient(string path, JsonSerializerSettings jsonSerializerSettings = null, ILogger log = null) : this(path, jsonSerializerSettings)
@@ -141,7 +154,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
             return _clientWebSocket;
         }
 
-        [Obsolete("This method is intended to support internal functionality and should not be used directly.")]
+        [Obsolete("This method is intended to support internal functionality and should not be used directly. Callers should prefer to only use SendAsync.")]
         public async Task<WebSocketReceiveResult> ReceiveBufferedResponseAsync(ClientWebSocket client, byte[] buffer)
         {
             try
@@ -161,10 +174,10 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
         }
 
-        [Obsolete("This method is intended to support internal functionality and should not be used directly.")]
+        [Obsolete("This method is intended to support internal functionality and should not be used directly. Callers should prefer to only use SendAsync.")]
         public async Task<MemoryStream> ReceiveFullResponseAsync(ClientWebSocket client)
         {
-            var responseMessageStream = new MemoryStream(ReadBufferSize);
+            var responseMessageStream = new MemoryStream(DefaultMessageBufferSize);
 
             var completedMessage = false;
 
@@ -222,17 +235,16 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 }
 
                 memoryStream.Position = 0;
-                using (var streamReader = new StreamReader(memoryStream))
+
+                using (var streamReader = new StreamReader(memoryStream, WebSocketMessageEncoding))
                 using (var reader = new JsonTextReader(streamReader))
                 {
                     reader.Read();
 
-                    var serializer = JsonSerializer.Create(JsonSerializerSettings);
-
                     // Check if it's a single message or a batch (a batch would be a StartArray token)
                     if(reader.TokenType == JsonToken.StartObject)
                     {
-                        var responseMessage = serializer.Deserialize<RpcResponseMessage>(reader);
+                        var responseMessage = _jsonSerializer.Deserialize<RpcResponseMessage>(reader);
                         
                         // If the pending request task completion source still exists, try to resolve it with the response
                         if(_pendingRequests.TryGetValue(responseMessage.Id, out var responseTaskCompletionSource))
@@ -251,7 +263,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
                         if(_pendingBatchRequests.TryPeek(out var responseTaskCompletionSource))
                         {
                             // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
-                            responseTaskCompletionSource.SetResult(serializer.Deserialize<RpcResponseMessage[]>(reader));
+                            responseTaskCompletionSource.SetResult(_jsonSerializer.Deserialize<RpcResponseMessage[]>(reader));
                         }
                         else
                         {
@@ -279,26 +291,35 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
             try
             {
-                var rpcRequestJson = JsonConvert.SerializeObject(request, JsonSerializerSettings);
-                var requestBytes = new ArraySegment<byte>(Encoding.UTF8.GetBytes(rpcRequestJson));
-                
-                logger.LogRequest(rpcRequestJson);
-
-                var webSocket = await GetClientWebSocketAsync().ConfigureAwait(false);
-
-                try
+                using(MemoryStream requestMessageStream = new MemoryStream(DefaultMessageBufferSize))
                 {
-                    await _semaphoreSlimWrite.WaitAsync().ConfigureAwait(false);
-                    
-                    using(var cancellationTokenSource = new CancellationTokenSource(ConnectionTimeout))
+                    using(StreamWriter streamWriter = new StreamWriter(requestMessageStream, WebSocketMessageEncoding, DefaultMessageBufferSize, true))
                     {
-                        await webSocket.SendAsync(requestBytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token)
-                            .ConfigureAwait(false);
+                        _jsonSerializer.Serialize(streamWriter, request);
                     }
-                }
-                finally
-                {
-                    _semaphoreSlimWrite.Release();
+                    
+                    // Avoid allocation of string if not logging
+                    if(logger.IsLogTraceEnabled())
+                    {
+                        logger.LogRequest(WebSocketMessageEncoding.GetString(requestMessageStream.GetBuffer(), 0, (int)requestMessageStream.Length));
+                    }
+
+                    var webSocket = await GetClientWebSocketAsync().ConfigureAwait(false);
+
+                    try
+                    {
+                        await _semaphoreSlimWrite.WaitAsync().ConfigureAwait(false);
+                        
+                        using(var cancellationTokenSource = new CancellationTokenSource(ConnectionTimeout))
+                        {
+                            await webSocket.SendAsync(new ArraySegment<byte>(requestMessageStream.GetBuffer(), 0, (int)requestMessageStream.Length), WebSocketMessageType.Text, true, cancellationTokenSource.Token)
+                                .ConfigureAwait(false);
+                        }
+                    }
+                    finally
+                    {
+                        _semaphoreSlimWrite.Release();
+                    }
                 }
 
                 var responseMessage = await responseTaskCompletionSource.Task.ConfigureAwait(false);

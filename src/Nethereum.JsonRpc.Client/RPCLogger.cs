@@ -185,7 +185,7 @@ namespace Nethereum.JsonRpc.Client
             return message.Error != null && message.HasError;
         }
 
-        private bool IsLogTraceEnabled()
+        public bool IsLogTraceEnabled()
         {
             return Log != null && Log.IsEnabled(LogLevel.Trace);
         }
