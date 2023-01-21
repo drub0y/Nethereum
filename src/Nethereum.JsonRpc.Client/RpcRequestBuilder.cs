@@ -11,13 +11,13 @@
 
         public virtual RpcRequest BuildRequest(object id, params object[] paramList)
         {
-            if (id == null) id = Configuration.DefaultRequestId;
+            if (id == null) id = Configuration.NextUniqueRequestId();
             return new RpcRequest(id, MethodName, paramList);
         }
 
         public virtual RpcRequest BuildRequest(object id = null)
         {
-            if (id == null) id = Configuration.DefaultRequestId;
+            if (id == null) id = Configuration.NextUniqueRequestId();
             return new RpcRequest(id, MethodName);
         }
     }
