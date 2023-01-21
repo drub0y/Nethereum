@@ -1,4 +1,4 @@
-
+﻿
 using Nethereum.JsonRpc.Client;
 using Nethereum.JsonRpc.Client.RpcMessages;
 using Newtonsoft.Json;
@@ -65,15 +65,12 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
         }
 
-       
-
-
         public WebSocketClient(string path, JsonSerializerSettings jsonSerializerSettings = null, ILogger log = null) : this(path, jsonSerializerSettings)
         {
             _log = log;
         }
 
-        public  Task StopAsync()
+        public Task StopAsync()
         {
              return StopAsync(WebSocketCloseStatus.NormalClosure, "", new CancellationTokenSource(ConnectionTimeout).Token);
         }
@@ -100,8 +97,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
                     _semaphoreSlimWrite.Release();
                     _semaphoreSlimClientWebSocket.Release();
                 }
-            }                
-
+            }
         }
 
         private async Task<ClientWebSocket> GetClientWebSocketAsync()
@@ -207,7 +203,12 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 }
             }
 
-            if (responseMessageStream.Length == 0) return await ReceiveFullResponseAsync(client).ConfigureAwait(false); //empty response
+            // If the response was empty, loop through again asynchronously to get the next response
+            if (responseMessageStream.Length == 0)
+            {
+                return await ReceiveFullResponseAsync(client).ConfigureAwait(false);
+            }
+
             return responseMessageStream;
         }
 
@@ -283,7 +284,8 @@ namespace Nethereum.JsonRpc.WebSocketClient
         {
             var responseTaskCompletionSource = new TaskCompletionSource<RpcResponseMessage>();
             
-            if(!this._pendingRequests.TryAdd(request.Id, responseTaskCompletionSource)) {
+            if(!this._pendingRequests.TryAdd(request.Id, responseTaskCompletionSource)) 
+            {
                 throw new InvalidOperationException($"A request with the specified id is already pending: {request.Id}");
             }
 
@@ -408,21 +410,16 @@ namespace Nethereum.JsonRpc.WebSocketClient
             {
                 
             }
+
             _clientWebSocket?.Dispose();
             _clientWebSocket = null;
         }
 
         private sealed class RequestMessageIdValueEqualityComparer : IEqualityComparer<Object>
         {
-            public new bool Equals(object x, object y)
-            {
-                return x?.Equals(y) ?? y == null;
-            }
+            bool IEqualityComparer<Object>.Equals(object x, object y) => x?.Equals(y) ?? y == null;
 
-            public int GetHashCode(object obj)
-            {
-                return obj?.GetHashCode() ?? 0;
-            }
+            int IEqualityComparer<Object>.GetHashCode(object obj) => obj?.GetHashCode() ?? 0;
         }
     }
 }
