@@ -1,4 +1,4 @@
-﻿
+
 using Nethereum.JsonRpc.Client;
 using Nethereum.JsonRpc.Client.RpcMessages;
 using Newtonsoft.Json;
@@ -352,25 +352,35 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
             try
             {
-                var rpcRequestJson = JsonConvert.SerializeObject(requests, JsonSerializerSettings);
-                var requestBytes = new ArraySegment<byte>(Encoding.UTF8.GetBytes(rpcRequestJson));
-                logger.LogRequest(rpcRequestJson);
-                
-                var webSocket = await GetClientWebSocketAsync().ConfigureAwait(false);
-                var cancellationTokenSource = new CancellationTokenSource();
+                using(MemoryStream requestMessageStream = new MemoryStream(DefaultMessageBufferSize))
+                {
+                    using(StreamWriter streamWriter = new StreamWriter(requestMessageStream, WebSocketMessageEncoding, DefaultMessageBufferSize, true))
+                    {
+                        _jsonSerializer.Serialize(streamWriter, requests);
+                    }
 
-                try
-                {
-                    await _semaphoreSlimWrite.WaitAsync().ConfigureAwait(false);
-                    cancellationTokenSource.CancelAfter(ConnectionTimeout);
+                    // Avoid allocation of string if not logging
+                    if(logger.IsLogTraceEnabled())
+                    {
+                        logger.LogRequest(WebSocketMessageEncoding.GetString(requestMessageStream.GetBuffer(), 0, (int)requestMessageStream.Length));
+                    }
                 
-                    await webSocket.SendAsync(requestBytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token)
-                        .ConfigureAwait(false);
-                }
-                finally
-                {
-                    _semaphoreSlimWrite.Release();
-                    cancellationTokenSource.Dispose();
+                    var webSocket = await GetClientWebSocketAsync().ConfigureAwait(false);
+
+                    try
+                    {
+                        await _semaphoreSlimWrite.WaitAsync().ConfigureAwait(false);
+                        
+                        using(var cancellationTokenSource = new CancellationTokenSource(ConnectionTimeout))
+                        {                
+                            await webSocket.SendAsync(new ArraySegment<byte>(requestMessageStream.GetBuffer(), 0, (int)requestMessageStream.Length), WebSocketMessageType.Text, true, cancellationTokenSource.Token)
+                                .ConfigureAwait(false);
+                        }
+                    }
+                    finally
+                    {
+                        _semaphoreSlimWrite.Release();
+                    }
                 }
 
                 return await responseTaskCompletionSource.Task.ConfigureAwait(false);
