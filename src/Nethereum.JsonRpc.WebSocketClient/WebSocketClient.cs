@@ -126,7 +126,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
                             await _clientWebSocket.ConnectAsync(new Uri(Path), new CancellationTokenSource(ConnectionTimeout).Token).ConfigureAwait(false);
 
                             // Start the async read loop now that we are connected
-                            ReadNextResponseMessage(_clientWebSocket);
+                            Task.Run(() => ReadNextResponseMessage(_clientWebSocket));
                         }
                     }
                     finally
@@ -277,7 +277,7 @@ namespace Nethereum.JsonRpc.WebSocketClient
             }
 
             // Initiate the read of the next response message (effectively an async read loop)
-            ReadNextResponseMessage(client);
+            Task.Run(() => ReadNextResponseMessage(client));
         }
 
         protected override async Task<RpcResponseMessage> SendAsync(RpcRequestMessage request, string route = null)
