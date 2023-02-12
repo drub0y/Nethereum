@@ -178,37 +178,34 @@ namespace Nethereum.JsonRpc.WebSocketClient
 
             var completedMessage = false;
 
-            while (!completedMessage)
-            {
-                var receivedResult = await ReceiveBufferedResponseAsync(client, _readBuffer).ConfigureAwait(false);
-                var bytesRead = receivedResult.Count;
-                
-                if (bytesRead > 0)
+            do {
+                do
                 {
-                    responseMessageStream.Write(_readBuffer, 0, bytesRead);
-
-                    var lastByte = _readBuffer[bytesRead - 1];
-
-                    if (lastByte == 10 || receivedResult.EndOfMessage)  //return signaled with a line feed / or just less than the full message
+                    var receivedResult = await ReceiveBufferedResponseAsync(client, _readBuffer).ConfigureAwait(false);
+                    var bytesRead = receivedResult.Count;
+                    
+                    if (bytesRead > 0)
                     {
-                        completedMessage = true;
-                    }
-                }
-                else
-                {
-                    // We have had a response already and EndOfMessage
-                    if(receivedResult.EndOfMessage)
-                    {
-                        completedMessage = true;
-                    }
-                }
-            }
+                        responseMessageStream.Write(_readBuffer, 0, bytesRead);
 
-            // If the response was empty, loop through again asynchronously to get the next response
-            if (responseMessageStream.Length == 0)
-            {
-                return await ReceiveFullResponseAsync(client).ConfigureAwait(false);
+                        var lastByte = _readBuffer[bytesRead - 1];
+
+                        if (lastByte == 10 || receivedResult.EndOfMessage)  //return signaled with a line feed / or just less than the full message
+                        {
+                            completedMessage = true;
+                        }
+                    }
+                    else
+                    {
+                        // We have had a response already and EndOfMessage
+                        if(receivedResult.EndOfMessage)
+                        {
+                            completedMessage = true;
+                        }
+                    }
+                } while (!completedMessage); // If we haven't received the full message, loop through again to complete reading it
             }
+            while(responseMessageStream.Length == 0); // If the response was empty, loop through again to get the next response
 
             return responseMessageStream;
         }
@@ -258,6 +255,8 @@ namespace Nethereum.JsonRpc.WebSocketClient
                             }
                         }
                     }
+                } catch (RpcClientTimeoutException timeoutException) {
+                    _log.LogTrace("ReadNextResponseMessage timed out. This could just mean there were no incoming messages to read at this time; will continue to try reading as long as the connection is still open.");
                 } catch (Exception exception) {
                     _log.LogError(exception, "Error reading RPC response.");
                 }
