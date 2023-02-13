@@ -126,8 +126,8 @@ namespace Nethereum.JsonRpc.WebSocketClient
                                 await _clientWebSocket.ConnectAsync(new Uri(Path), connectionTimeoutCancellationTokenSource.Token).ConfigureAwait(false);
                             }
 
-                            // Start the async read loop now that we are connected
-                            Task.Run(() => ReadNextResponseMessage(_clientWebSocket));
+                            // Start a dedicated, long running Task for the async read loop now that we are connected
+                            Task.Factory.StartNew(() => ReadNextResponseMessage(_clientWebSocket), TaskCreationOptions.LongRunning);
                         }
                     }
                     finally
@@ -218,43 +218,54 @@ namespace Nethereum.JsonRpc.WebSocketClient
                 {
                     var memoryStream = await ReceiveFullResponseAsync(client).ConfigureAwait(false);
                     
-                    memoryStream.Position = 0;
+                    // Dispatch processing of the response to a task pool thread so our thread can begin
+                    // receiving the next message from the websocket ASAP (NOTE: also prevents anyone handling the
+                    // response itself won't from blocking us!)
+                    Task.Run(() => {
+                        memoryStream.Position = 0;
 
-                    using (var streamReader = new StreamReader(memoryStream, WebSocketMessageEncoding))
-                    using (var reader = new JsonTextReader(streamReader))
-                    {
-                        reader.Read();
-
-                        // Check if it's a single message or a batch (a batch would be a StartArray token)
-                        if(reader.TokenType == JsonToken.StartObject)
+                        using (var streamReader = new StreamReader(memoryStream, WebSocketMessageEncoding))
+                        using (var reader = new JsonTextReader(streamReader))
                         {
-                            var responseMessage = _jsonSerializer.Deserialize<RpcResponseMessage>(reader);
-                            
-                            // If the pending request task completion source still exists, try to resolve it with the response
-                            if(_pendingRequests.TryGetValue(responseMessage.Id, out var responseTaskCompletionSource))
+                            reader.Read();
+
+                            // Check if it's a single message or a batch (a batch would be a StartArray token)
+                            if(reader.TokenType == JsonToken.StartObject)
                             {
-                                // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
-                                responseTaskCompletionSource.SetResult(responseMessage);
+                                var responseMessage = _jsonSerializer.Deserialize<RpcResponseMessage>(reader);
+                                
+                                // If the pending request task completion source still exists, try to resolve it with the response
+                                if(_pendingRequests.TryGetValue(responseMessage.Id, out var responseTaskCompletionSource))
+                                {
+                                    // Check if we received an non-empty response and, if so, complete the TaskCompletionSource with it
+                                    Task.Run(() => responseTaskCompletionSource.SetResult(responseMessage));
+                                }
+                                else
+                                {
+                                    _log.Log(LogLevel.Warning, $"No pending request found for response with id: {responseMessage.Id}; dropping.");
+                                }
                             }
                             else
                             {
-                                _log.Log(LogLevel.Warning, $"No pending request found for response with id: {responseMessage.Id}; dropping.");
+                                // If the pending request task completion source still exists, try to resolve it with the response
+                                if(_pendingBatchRequests.TryPeek(out var responseTaskCompletionSource))
+                                {
+                                    var rpcResponseMessage = _jsonSerializer.Deserialize<RpcResponseMessage[]>(reader);
+
+                                    // Check if we received an non-empty response and, if so, complete the
+                                    // TaskCompletionSource with it.
+                                    // NOTE: we complete the TaskCompletionSource on another TaskPoolThread so that we don't
+                                    // block 
+                                    Task.Run(() => responseTaskCompletionSource.SetResult(rpcResponseMessage));
+                                }
+                                else
+                                {
+                                    _log.Log(LogLevel.Warning, $"No pending batch requests found; dropping batch response.");
+                                }
                             }
                         }
-                        else
-                        {
-                            // If the pending request task completion source still exists, try to resolve it with the response
-                            if(_pendingBatchRequests.TryPeek(out var responseTaskCompletionSource))
-                            {
-                                // Check if we got an non-empty response and, if so, complete the TaskCompletionSource with it
-                                responseTaskCompletionSource.SetResult(_jsonSerializer.Deserialize<RpcResponseMessage[]>(reader));
-                            }
-                            else
-                            {
-                                _log.Log(LogLevel.Warning, $"No pending batch requests found; dropping batch response.");
-                            }
-                        }
-                    }
+                    });
+                    
                 } catch (RpcClientTimeoutException timeoutException) {
                     _log.LogTrace("ReadNextResponseMessage timed out. This could just mean there were no incoming messages to read at this time; will continue to try reading as long as the connection is still open.");
                 } catch (Exception exception) {
